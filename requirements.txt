@@ -4,4 +4,4 @@ numpy
 plotly
 joblib
 scikit-learn
-tensorflow-cpu
+tensorflow-cpu==2.13.0

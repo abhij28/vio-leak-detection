@@ -6,6 +6,8 @@ import joblib
 import logging
 import warnings
 import os
+import requests
+import io
 from datetime import datetime
 warnings.filterwarnings("ignore")
 logging.getLogger("streamlit").setLevel(logging.ERROR)
@@ -94,12 +96,51 @@ h4 {{ color: #C8A8FF !important; }}
 """, unsafe_allow_html=True)
 
 
-# ── All files are in the repo root (flat structure) ──────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def get_path(filename):
-    """Return absolute path to a file in the same directory as app.py."""
     return os.path.join(BASE_DIR, filename)
+
+# ── Google Drive file ID ──────────────────────────────────────────────────────
+GDRIVE_FILE_ID = "13iYJfC6kEFutN5nGGr0MlrQ_V2LQOLF2"
+
+@st.cache_data(ttl=3600, show_spinner="Loading fleet telemetry from Google Drive...")
+def load_data():
+    """Download parquet from Google Drive and load into DataFrame."""
+    # Direct download URL for Google Drive
+    url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm=t"
+
+    try:
+        session = requests.Session()
+        response = session.get(url, stream=True, timeout=120)
+
+        # Handle Google's virus-scan warning page for large files
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm={value}"
+                response = session.get(url, stream=True, timeout=120)
+                break
+
+        response.raise_for_status()
+        content = response.content
+        df = pd.read_parquet(io.BytesIO(content))
+
+        # Ensure datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['Log_Date_Time']):
+            df['Log_Date_Time'] = pd.to_datetime(df['Log_Date_Time'])
+
+        # Fill missing sensor columns with 0
+        for col in ['FTHP','CHP','ABP','FLT','GIP','GIR','Battery_Voltage',
+                    'FTHP_battery_volt','CHP_battery_volt','ABP_battery_volt']:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        return df
+
+    except Exception as e:
+        st.error(f"Failed to load data from Google Drive: {e}")
+        st.info("Make sure the Google Drive file is shared as 'Anyone with the link can view'.")
+        st.stop()
 
 
 @st.cache_resource
@@ -114,19 +155,15 @@ def load_models():
         st.error(f"Model load error: {e}")
         return None
 
-    # TensorFlow / Keras autoencoder — optional, skipped if TF not installed
     try:
-        from tensorflow.keras.models import load_model  # noqa
-
+        from tensorflow.keras.models import load_model
         keras_path = get_path("ae_leak.keras")
-        # If only the zip was uploaded, try to extract it first
         if not os.path.exists(keras_path):
             zip_path = get_path("ae_leak.keras.zip")
             if os.path.exists(zip_path):
                 import zipfile
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     zf.extractall(BASE_DIR)
-
         m['ae_model']     = load_model(keras_path)
         m['ae_scaler']    = joblib.load(get_path("scaler_ae_leak.pkl"))
         m['ae_threshold'] = joblib.load(get_path("threshold_ae_leak.pkl"))
@@ -136,14 +173,6 @@ def load_models():
         m['ae_loaded'] = False
 
     return m
-
-
-@st.cache_data(ttl=300)
-def load_data():
-    return pd.read_csv(
-        get_path("sample_wells.csv"),
-        parse_dates=['Log_Date_Time']
-    )
 
 
 def compute_leak_features(well_df):
@@ -160,8 +189,8 @@ def compute_leak_features(well_df):
     df['ABP_mean_6']        = df['ABP'].rolling(6,   min_periods=1).mean()
     df['ABP_mean_24']       = df['ABP'].rolling(24,  min_periods=1).mean()
     df['ABP_std_24']        = df['ABP'].rolling(24,  min_periods=1).std().fillna(0)
-    df['FTHP_diff']         = df['FTHP'].diff().fillna(0)
-    df['CHP_diff']          = df['CHP'].diff().fillna(0)
+    df['FTHP_diff']         = df['FTHP_delta'] if 'FTHP_delta' in df.columns else df['FTHP'].diff().fillna(0)
+    df['CHP_diff']          = df['CHP_delta']  if 'CHP_delta'  in df.columns else df['CHP'].diff().fillna(0)
     df['ABP_diff']          = df['ABP'].diff().fillna(0)
     df['FTHP_sudden_drop']  = (df['FTHP_diff'] < -5).astype(int)
     df['CHP_sudden_drop']   = (df['CHP_diff']  < -5).astype(int)
@@ -243,10 +272,9 @@ def plotly_dark(fig, height=350, **kw):
     return fig
 
 
-# ── Load resources ────────────────────────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────────────────────
 mdls = load_models()
 df   = load_data()
-
 well_list = sorted(df['well_id'].unique().tolist())
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -261,7 +289,7 @@ st.markdown(f"""
         </div>
     </div>
     <span style='float:right; font-size:11px; color:#C8A8FF; margin-top:8px;'>
-        {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;|&nbsp; Demo Mode
+        {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;|&nbsp; {len(well_list)} Wells Loaded
     </span>
 </div>
 """, unsafe_allow_html=True)
@@ -278,46 +306,71 @@ with st.sidebar:
         <div style='height:1px; background:linear-gradient(90deg,transparent,{P_NEON},transparent); margin:12px 0;'></div>
     </div>
     """, unsafe_allow_html=True)
-    selected_well    = st.selectbox("Select Well", well_list)
-    well_type_filter = st.selectbox("Filter by Type", ["All", "Self flow", "Gas lift"])
+
+    well_type_filter = st.selectbox("Filter by Well Type", ["All", "Self flow", "Gas lift"])
+
+    if well_type_filter != "All":
+        filtered_wells = sorted(df[df['well_type'] == well_type_filter]['well_id'].unique().tolist())
+        if not filtered_wells:
+            st.warning("No wells for this type.")
+            filtered_wells = well_list
+    else:
+        filtered_wells = well_list
+
+    selected_well = st.selectbox("Select Well", filtered_wells)
+
+    well_dates = df[df['well_id'] == selected_well]['Log_Date_Time']
+    min_date   = well_dates.min().date()
+    max_date   = well_dates.max().date()
+    date_range = st.date_input("Date Range", value=(min_date, max_date),
+                                min_value=min_date, max_value=max_date)
+
     model_status = "Ensemble (AE + IsolationForest)" if mdls and mdls.get('ae_loaded') else "IsolationForest only"
     st.markdown(f"""
     <div style='margin-top:16px; padding:12px; background:{P_DARK}; border-radius:10px;
          border:1px solid {P_NEON}22; font-size:11px; color:#C8A8FF;'>
         <div style='margin-bottom:4px;'>Model: {model_status}</div>
-        <div style='margin-bottom:4px;'>Wells loaded: {len(well_list)}</div>
+        <div style='margin-bottom:4px;'>Total wells: {len(well_list)}</div>
+        <div style='margin-bottom:4px;'>Data rows: {len(df):,}</div>
         <div style='color:{P_NEON}; font-weight:600; letter-spacing:1px;'>LEAK DETECTION ACTIVE</div>
     </div>
     """, unsafe_allow_html=True)
 
 # ── Well data ─────────────────────────────────────────────────────────────────
 well_data = df[df['well_id'] == selected_well].copy()
-if well_type_filter != "All":
-    well_data = well_data[well_data['well_type'] == well_type_filter]
+
+if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+    start_dt = pd.Timestamp(date_range[0])
+    end_dt   = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1)
+    well_data = well_data[(well_data['Log_Date_Time'] >= start_dt) &
+                          (well_data['Log_Date_Time'] <  end_dt)]
     if len(well_data) == 0:
-        st.warning(f"No {well_type_filter} wells match. Showing all types.")
+        st.warning("No data in selected date range. Showing all dates.")
         well_data = df[df['well_id'] == selected_well].copy()
+
 well_data  = well_data.sort_values('Log_Date_Time').reset_index(drop=True)
 well_feats = compute_leak_features(well_data)
 latest     = well_feats.iloc[-1]
 well_type  = well_data['well_type'].iloc[0]
 
 # ── Top metrics ───────────────────────────────────────────────────────────────
-m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 with m1: st.metric("FTHP",      f"{latest['FTHP']:.1f} psi")
 with m2: st.metric("CHP",       f"{latest['CHP']:.1f} psi")
 with m3: st.metric("ABP",       f"{latest['ABP']:.1f} psi")
-with m4: st.metric("CHP-FTHP",  f"{latest['CHP_FTHP_diff']:.1f} psi")
-with m5: st.metric("Well Type", well_type)
-with m6: st.metric("SCP Alert", "YES" if latest['CHP'] > latest['FTHP'] * 1.5 else "NO")
+with m4: st.metric("GIP",       f"{latest.get('GIP', 0):.1f}")
+with m5: st.metric("CHP-FTHP",  f"{latest['CHP_FTHP_diff']:.1f} psi")
+with m6: st.metric("Well Type", well_type)
+with m7: st.metric("SCP Alert", "YES" if latest['CHP'] > latest['FTHP'] * 1.5 else "NO")
 
 st.markdown("<div class='glow-div'></div>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "AI Prediction", "Pressure Analysis", "Integrity Indicators", "Fleet Scan"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "AI Prediction", "Pressure Analysis", "Integrity Indicators", "Power & GIR", "Fleet Scan"
 ])
 
+# ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
     col_pred, col_info = st.columns(2)
     with col_pred:
@@ -376,16 +429,25 @@ with tab1:
                 st.error("Models not loaded. Check that all .pkl files are in the repo root.")
 
     with col_info:
-        st.markdown("### Current Sensor Values")
-        sensors = pd.DataFrame({
-            "Sensor": ["FTHP","CHP","ABP","FLT","CHP-FTHP Diff","FTHP-ABP Diff","Battery V"],
-            "Value" : [
-                f"{latest['FTHP']:.2f} psi", f"{latest['CHP']:.2f} psi",
-                f"{latest['ABP']:.2f} psi",  f"{latest['FLT']:.2f} C",
-                f"{latest['CHP_FTHP_diff']:.2f} psi", f"{latest['FTHP_ABP_diff']:.2f} psi",
-                f"{latest['Battery_Voltage']:.2f} V"
-            ]
-        })
+        st.markdown("### Latest Sensor Snapshot")
+        sensor_rows = [
+            ("FTHP",          f"{latest['FTHP']:.2f} psi"),
+            ("CHP",           f"{latest['CHP']:.2f} psi"),
+            ("ABP",           f"{latest['ABP']:.2f} psi"),
+            ("GIP",           f"{latest.get('GIP', 0):.2f}"),
+            ("FLT",           f"{latest.get('FLT', 0):.2f} °C"),
+            ("GIR",           f"{latest.get('GIR', 0):.2f}"),
+            ("Battery V",     f"{latest.get('Battery_Voltage', 0):.2f} V"),
+            ("FTHP Batt V",   f"{latest.get('FTHP_battery_volt', 0):.2f} V"),
+            ("CHP Batt V",    f"{latest.get('CHP_battery_volt', 0):.2f} V"),
+            ("ABP Batt V",    f"{latest.get('ABP_battery_volt', 0):.2f} V"),
+            ("CHP-FTHP Diff", f"{latest['CHP_FTHP_diff']:.2f} psi"),
+            ("FTHP-ABP Diff", f"{latest['FTHP_ABP_diff']:.2f} psi"),
+            ("GIR scmd",      f"{latest.get('gir_scmd', 0):.2f}" if pd.notna(latest.get('gir_scmd')) else "N/A"),
+            ("GIR mmscfd",    f"{latest.get('gir_mmscfd', 0):.4f}" if pd.notna(latest.get('gir_mmscfd')) else "N/A"),
+            ("Log Time",      str(latest['Log_Date_Time'])[:19]),
+        ]
+        sensors = pd.DataFrame(sensor_rows, columns=["Sensor", "Value"])
         st.dataframe(sensors, use_container_width=True, hide_index=True)
         st.markdown("### Risk Guide")
         for label, color, desc in [
@@ -402,6 +464,7 @@ with tab1:
                 <span style='color:#C8A8FF; font-size:11px;'>{desc}</span>
             </div>""", unsafe_allow_html=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     recent = well_feats.tail(300).copy()
     c1, c2 = st.columns(2)
@@ -432,19 +495,23 @@ with tab2:
             ))
         plotly_dark(fig2, height=320, yaxis_title="Pressure (psi)", title="FTHP & CHP with Drop Events")
         st.plotly_chart(fig2, use_container_width=True)
-    st.markdown("#### Multi-Pressure Timeline")
+    st.markdown("#### Multi-Pressure Timeline (FTHP / CHP / ABP / GIP)")
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['FTHP'], mode='lines', line=dict(color=P_NEON,   width=1.5), name='FTHP'))
     fig3.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['CHP'],  mode='lines', line=dict(color=C_ORANGE, width=1.5), name='CHP'))
     fig3.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['ABP'],  mode='lines', line=dict(color=C_GREEN,  width=1.5), name='ABP'))
+    if 'GIP' in recent.columns:
+        fig3.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['GIP'], mode='lines', line=dict(color=C_YELLOW, width=1.5), name='GIP'))
     plotly_dark(fig3, height=280, yaxis_title="Pressure (psi)", title="All Pressures — Last 300 Readings")
     st.plotly_chart(fig3, use_container_width=True)
-    d1, d2, d3, d4 = st.columns(4)
+    d1, d2, d3, d4, d5 = st.columns(5)
     with d1: st.metric("Avg FTHP",    f"{recent['FTHP'].mean():.1f} psi")
     with d2: st.metric("Avg CHP",     f"{recent['CHP'].mean():.1f} psi")
     with d3: st.metric("Avg ABP",     f"{recent['ABP'].mean():.1f} psi")
-    with d4: st.metric("Drop Events", int(recent['FTHP_sudden_drop'].sum()))
+    with d4: st.metric("Avg GIP",     f"{recent['GIP'].mean():.1f}" if 'GIP' in recent.columns else "N/A")
+    with d5: st.metric("Drop Events", int(recent['FTHP_sudden_drop'].sum()))
 
+# ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
     recent     = well_feats.tail(300).copy()
     scp_count  = int(recent['scp_indicator'].sum())
@@ -468,10 +535,10 @@ with tab3:
     </div>
     """, unsafe_allow_html=True)
     i1, i2, i3, i4 = st.columns(4)
-    with i1: st.metric("SCP Events",       scp_count,  help="Sustained Casing Pressure events")
-    with i2: st.metric("Sudden Drops",     drop_count, help="FTHP drops > 5 psi in one step")
-    with i3: st.metric("Cross-Zone Flags", cross_zone, help="FLT z-score > 2.5")
-    with i4: st.metric("Integrity Alerts", integrity,  help="Combined integrity indicator")
+    with i1: st.metric("SCP Events",       scp_count)
+    with i2: st.metric("Sudden Drops",     drop_count)
+    with i3: st.metric("Cross-Zone Flags", cross_zone)
+    with i4: st.metric("Integrity Alerts", integrity)
     st.markdown("<div class='glow-div'></div>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     with c1:
@@ -499,7 +566,7 @@ with tab3:
                 mode='markers', marker=dict(color=C_YELLOW, size=8), name='Cross-Zone Flag'))
         plotly_dark(fig5, height=280, yaxis_title="Z-Score")
         st.plotly_chart(fig5, use_container_width=True)
-    st.markdown("#### Integrity Events Log")
+    st.markdown("#### Integrity Events Log (last 20)")
     alerts_df = recent[
         (recent['scp_indicator']==1) | (recent['FTHP_sudden_drop']==1) |
         (recent['cross_zone_flag']==1) | (recent['integrity_alert']==1)
@@ -510,17 +577,76 @@ with tab3:
     else:
         st.success("No integrity events detected in last 300 readings.")
 
+# ═══════════════════════════════════════════════════════════════════════════════
 with tab4:
+    recent = well_feats.tail(300).copy()
+    st.markdown("### Power & Gas Injection Rate")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("#### Active Power & Frequency")
+        fig_p = go.Figure()
+        if 'output_active_Power' in recent.columns:
+            fig_p.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['output_active_Power'],
+                mode='lines', line=dict(color=P_NEON, width=1.5), name='Active Power'))
+        if 'output_System_Frequency' in recent.columns:
+            fig_p.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['output_System_Frequency'],
+                mode='lines', line=dict(color=C_YELLOW, width=1.5), name='Frequency', yaxis='y2'))
+        fig_p.update_layout(yaxis2=dict(overlaying='y', side='right', gridcolor='rgba(0,0,0,0)'))
+        plotly_dark(fig_p, height=280, title="Power & Frequency")
+        st.plotly_chart(fig_p, use_container_width=True)
+    with p2:
+        st.markdown("#### Voltage & Current")
+        fig_v = go.Figure()
+        if 'output_Average_Voltage_L2N' in recent.columns:
+            fig_v.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['output_Average_Voltage_L2N'],
+                mode='lines', line=dict(color=C_GREEN, width=1.5), name='Avg Voltage L2N'))
+        if 'output_Average_Current' in recent.columns:
+            fig_v.add_trace(go.Scatter(x=recent['Log_Date_Time'], y=recent['output_Average_Current'],
+                mode='lines', line=dict(color=C_ORANGE, width=1.5), name='Avg Current', yaxis='y2'))
+        fig_v.update_layout(yaxis2=dict(overlaying='y', side='right', gridcolor='rgba(0,0,0,0)'))
+        plotly_dark(fig_v, height=280, title="Voltage & Current")
+        st.plotly_chart(fig_v, use_container_width=True)
+    st.markdown("<div class='glow-div'></div>", unsafe_allow_html=True)
+    st.markdown("### Gas Injection Rate (GIR)")
+    fig_g = go.Figure()
+    gir_series = {'GIR': P_NEON, 'gir_scmd': C_GREEN, 'gir_sm3_hr': C_YELLOW, 'gir_mmscfd': C_ORANGE}
+    for col, color in gir_series.items():
+        if col in recent.columns:
+            valid = recent[recent[col].notna()]
+            if len(valid) > 0:
+                fig_g.add_trace(go.Scatter(x=valid['Log_Date_Time'], y=valid[col],
+                    mode='lines', line=dict(color=color, width=1.5), name=col))
+    plotly_dark(fig_g, height=260, title="GIR Metrics Over Time")
+    st.plotly_chart(fig_g, use_container_width=True)
+    g1, g2, g3, g4 = st.columns(4)
+    with g1: st.metric("Avg GIR",       f"{recent['GIR'].mean():.2f}"        if 'GIR'        in recent.columns else "N/A")
+    with g2: st.metric("Avg GIR scmd",  f"{recent['gir_scmd'].mean():.2f}"   if 'gir_scmd'   in recent.columns else "N/A")
+    with g3: st.metric("Avg sm3/hr",    f"{recent['gir_sm3_hr'].mean():.2f}" if 'gir_sm3_hr' in recent.columns else "N/A")
+    with g4: st.metric("Avg mmscfd",    f"{recent['gir_mmscfd'].mean():.4f}" if 'gir_mmscfd' in recent.columns else "N/A")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab5:
     st.markdown("### Fleet-Wide Leak Risk Scan")
-    st.info("Scans the latest reading for every well in the demo dataset.")
+    st.info(f"Scans the latest reading for every well — {len(well_list)} wells total.")
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        scan_type = st.selectbox("Well Type to Scan", ["All", "Self flow", "Gas lift"])
+    with col_opt2:
+        max_wells = st.slider("Max Wells to Scan", 10, len(well_list), min(100, len(well_list)), 10)
     if st.button("Run Fleet Scan", type="primary", use_container_width=True):
         if not mdls:
             st.error("Models not loaded.")
         else:
+            scan_wells = well_list
+            if scan_type != "All":
+                scan_wells = [w for w in well_list if
+                              df[df['well_id']==w]['well_type'].iloc[0] == scan_type]
+            scan_wells = scan_wells[:max_wells]
             fleet_results = []
-            progress      = st.progress(0)
-            all_wells     = df['well_id'].unique().tolist()
-            for i, wid in enumerate(all_wells):
+            progress    = st.progress(0)
+            status_text = st.empty()
+            for i, wid in enumerate(scan_wells):
+                status_text.text(f"Scanning {wid} ({i+1}/{len(scan_wells)})...")
                 wd   = df[df['well_id'] == wid].copy()
                 wf   = compute_leak_features(wd)
                 last = wf.iloc[-1]
@@ -530,12 +656,16 @@ with tab4:
                     "well_type": wd['well_type'].iloc[0],
                     "FTHP"     : round(float(last['FTHP']), 1),
                     "CHP"      : round(float(last['CHP']),  1),
+                    "ABP"      : round(float(last['ABP']),  1),
+                    "GIP"      : round(float(last.get('GIP', 0)), 1),
                     "severity" : res['severity'],
                     "score"    : res['leak_score'],
                     "scp"      : int(res['scp']),
-                    "ae_drift" : int(res['ae_anomaly'])
+                    "ae_drift" : int(res['ae_anomaly']),
+                    "last_seen": str(last['Log_Date_Time'])[:19],
                 })
-                progress.progress((i+1)/len(all_wells))
+                progress.progress((i+1)/len(scan_wells))
+            status_text.empty()
             results_df = pd.DataFrame(fleet_results)
             fc1, fc2, fc3, fc4, fc5 = st.columns(5)
             with fc1: st.metric("Wells Scanned", len(results_df))
@@ -550,14 +680,14 @@ with tab4:
                 x=sev_order, y=sev_counts.values,
                 marker_color=sev_cols, marker_line_color=P_DARK, marker_line_width=1.5
             ))
-            plotly_dark(fig6, height=280, title="Fleet Leak Risk Distribution", yaxis_title="Number of Wells")
+            plotly_dark(fig6, height=260, title="Fleet Leak Risk Distribution", yaxis_title="Wells")
             st.plotly_chart(fig6, use_container_width=True)
             def color_severity_cell(val):
                 return {
                     'CRITICAL LEAK': f'background-color:#2A0015; color:{C_RED}',
                     'HIGH RISK'    : f'background-color:#2A0F00; color:{C_ORANGE}',
                     'MEDIUM RISK'  : f'background-color:#2A2200; color:{C_YELLOW}',
-                    'LOW RISK'     : f'background-color:#0A0020; color:{C_GREEN}',
+                    'LOW RISK'     : f'background-color:#0A1A0A; color:{C_GREEN}',
                     'NO LEAK'      : f'background-color:#0D0020; color:{P_NEON}',
                 }.get(val, '')
             styled = results_df.sort_values('score', ascending=False).style.applymap(
@@ -574,8 +704,9 @@ with tab4:
                          padding:14px; margin:6px 0; box-shadow:0 2px 16px {color}22;'>
                         <b style='color:{color};'>{row['severity']}</b> —
                         <span style='color:{P_WHITE};'>{row['well_id']}</span>
+                        <span style='color:#8877AA; font-size:11px;'> [{row['well_type']}]</span>
                         <span style='color:#C8A8FF; float:right; font-size:12px;'>
-                            FTHP={row['FTHP']} | CHP={row['CHP']} | Score={row['score']:.3f}
+                            FTHP={row['FTHP']} | CHP={row['CHP']} | Score={row['score']:.3f} | {row['last_seen']}
                         </span>
                     </div>
                     """, unsafe_allow_html=True)

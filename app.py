@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import joblib
 import logging
 import warnings
+import os
 from datetime import datetime
 warnings.filterwarnings("ignore")
 logging.getLogger("streamlit").setLevel(logging.ERROR)
@@ -93,34 +94,54 @@ h4 {{ color: #C8A8FF !important; }}
 """, unsafe_allow_html=True)
 
 
+# ── All files are in the repo root (flat structure) ──────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def get_path(filename):
+    """Return absolute path to a file in the same directory as app.py."""
+    return os.path.join(BASE_DIR, filename)
+
+
 @st.cache_resource
 def load_models():
-    base = r"C:\Users\abhij\Desktop\VIO\models\leak"
     m = {}
     try:
-        m['classifier'] = joblib.load(f"{base}/model_leak_classifier.pkl")
-        m['isolation']  = joblib.load(f"{base}/model_leak_isolation.pkl")
-        m['scaler']     = joblib.load(f"{base}/scaler_leak.pkl")
-        m['features']   = joblib.load(f"{base}/features_leak.pkl")
+        m['classifier'] = joblib.load(get_path("model_leak_classifier.pkl"))
+        m['isolation']  = joblib.load(get_path("model_leak_isolation.pkl"))
+        m['scaler']     = joblib.load(get_path("scaler_leak.pkl"))
+        m['features']   = joblib.load(get_path("features_leak.pkl"))
     except Exception as e:
         st.error(f"Model load error: {e}")
         return None
+
+    # TensorFlow / Keras autoencoder — optional, skipped if TF not installed
     try:
-        from tensorflow.keras.models import load_model
-        m['ae_model']     = load_model(f"{base}/ae_leak.keras")
-        m['ae_scaler']    = joblib.load(f"{base}/scaler_ae_leak.pkl")
-        m['ae_threshold'] = joblib.load(f"{base}/threshold_ae_leak.pkl")
-        m['ae_features']  = joblib.load(f"{base}/features_ae_leak.pkl")
+        from tensorflow.keras.models import load_model  # noqa
+
+        keras_path = get_path("ae_leak.keras")
+        # If only the zip was uploaded, try to extract it first
+        if not os.path.exists(keras_path):
+            zip_path = get_path("ae_leak.keras.zip")
+            if os.path.exists(zip_path):
+                import zipfile
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(BASE_DIR)
+
+        m['ae_model']     = load_model(keras_path)
+        m['ae_scaler']    = joblib.load(get_path("scaler_ae_leak.pkl"))
+        m['ae_threshold'] = joblib.load(get_path("threshold_ae_leak.pkl"))
+        m['ae_features']  = joblib.load(get_path("features_ae_leak.pkl"))
         m['ae_loaded']    = True
-    except:
+    except Exception:
         m['ae_loaded'] = False
+
     return m
 
 
 @st.cache_data(ttl=300)
 def load_data():
     return pd.read_csv(
-        r"C:\Users\abhij\Desktop\VIO\data\sample_wells.csv",
+        get_path("sample_wells.csv"),
         parse_dates=['Log_Date_Time']
     )
 
@@ -176,7 +197,7 @@ def run_prediction(row_dict, mdls):
             Xa_pred = mdls['ae_model'].predict(Xa_sc, verbose=0)
             ae_mse  = float(np.mean(np.power(Xa_sc - Xa_pred, 2)))
             ae_anom = ae_mse > mdls['ae_threshold']
-        except:
+        except Exception:
             pass
     if ae_anom and severity == "NO LEAK":
         severity = "LOW RISK"
@@ -222,10 +243,13 @@ def plotly_dark(fig, height=350, **kw):
     return fig
 
 
-mdls      = load_models()
-df        = load_data()
+# ── Load resources ────────────────────────────────────────────────────────────
+mdls = load_models()
+df   = load_data()
+
 well_list = sorted(df['well_id'].unique().tolist())
 
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class='vio-header'>
     <span style='font-size:36px; font-weight:900; color:{P_NEON}; letter-spacing:4px;
@@ -242,6 +266,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
     <div style='text-align:center; padding:20px 0 12px;'>
@@ -265,6 +290,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+# ── Well data ─────────────────────────────────────────────────────────────────
 well_data = df[df['well_id'] == selected_well].copy()
 if well_type_filter != "All":
     well_data = well_data[well_data['well_type'] == well_type_filter]
@@ -276,6 +302,7 @@ well_feats = compute_leak_features(well_data)
 latest     = well_feats.iloc[-1]
 well_type  = well_data['well_type'].iloc[0]
 
+# ── Top metrics ───────────────────────────────────────────────────────────────
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 with m1: st.metric("FTHP",      f"{latest['FTHP']:.1f} psi")
 with m2: st.metric("CHP",       f"{latest['CHP']:.1f} psi")
@@ -286,6 +313,7 @@ with m6: st.metric("SCP Alert", "YES" if latest['CHP'] > latest['FTHP'] * 1.5 el
 
 st.markdown("<div class='glow-div'></div>", unsafe_allow_html=True)
 
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs([
     "AI Prediction", "Pressure Analysis", "Integrity Indicators", "Fleet Scan"
 ])
@@ -345,7 +373,7 @@ with tab1:
                             <div style='font-size:20px; color:{c};'>{y if val else n}</div>
                         </div>""", unsafe_allow_html=True)
             else:
-                st.error("Models not loaded. Check models/leak/ folder.")
+                st.error("Models not loaded. Check that all .pkl files are in the repo root.")
 
     with col_info:
         st.markdown("### Current Sensor Values")

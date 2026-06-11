@@ -108,19 +108,22 @@ def get_path(filename):
     return os.path.join(BASE_DIR, filename)
 
 
-# ── Load parquet from uploaded file bytes ─────────────────────────────────────
-@st.cache_data(show_spinner="Parsing telemetry data...")
-def load_data_from_bytes(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_parquet(io.BytesIO(file_bytes))
+# ── Load parquet — bytes stored in session_state immediately on upload ──────────
+def parse_and_cache(file_bytes: bytes, cache_key: str) -> pd.DataFrame:
+    """Parse parquet bytes once; result lives in session_state across all reruns."""
+    with st.spinner("⏳ Loading telemetry data… please wait"):
+        df = pd.read_parquet(io.BytesIO(file_bytes))
 
-    if not pd.api.types.is_datetime64_any_dtype(df['Log_Date_Time']):
-        df['Log_Date_Time'] = pd.to_datetime(df['Log_Date_Time'])
+        if not pd.api.types.is_datetime64_any_dtype(df['Log_Date_Time']):
+            df['Log_Date_Time'] = pd.to_datetime(df['Log_Date_Time'])
 
-    for col in ['FTHP','CHP','ABP','FLT','GIP','GIR','Battery_Voltage',
-                'FTHP_battery_volt','CHP_battery_volt','ABP_battery_volt']:
-        if col not in df.columns:
-            df[col] = 0.0
+        for col in ['FTHP','CHP','ABP','FLT','GIP','GIR','Battery_Voltage',
+                    'FTHP_battery_volt','CHP_battery_volt','ABP_battery_volt']:
+            if col not in df.columns:
+                df[col] = 0.0
 
+    st.session_state["_data_key"] = cache_key
+    st.session_state["_df"]       = df
     return df
 
 
@@ -293,9 +296,17 @@ with st.sidebar:
         help="Upload your fleet telemetry .parquet file",
         label_visibility="collapsed"
     )
+    # ── Read bytes immediately while the file object is valid ────────────────
+    if uploaded_file is not None:
+        cache_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("_data_key") != cache_key:
+            # New file — read bytes NOW before Streamlit reruns
+            raw_bytes = uploaded_file.read()
+            parse_and_cache(raw_bytes, cache_key)
+            st.rerun()
 
-# ── Show upload prompt if no file yet ────────────────────────────────────────
-if uploaded_file is None:
+# ── Show upload prompt if no data in session yet ──────────────────────────────
+if "_df" not in st.session_state:
     st.markdown(f"""
     <div style='display:flex; flex-direction:column; align-items:center; justify-content:center;
          min-height:60vh; gap:20px;'>
@@ -322,13 +333,8 @@ if uploaded_file is None:
     """, unsafe_allow_html=True)
     st.stop()
 
-# ── Parse uploaded file ───────────────────────────────────────────────────────
-file_bytes = uploaded_file.read()
-try:
-    df = load_data_from_bytes(file_bytes)
-except Exception as e:
-    st.error(f"Failed to parse parquet file: {e}")
-    st.stop()
+# ── Get df from session_state (always available after first upload) ───────────
+df = st.session_state["_df"]
 
 well_list = sorted(df['well_id'].unique().tolist())
 
@@ -338,7 +344,7 @@ with st.sidebar:
     <div style='padding:8px 12px; background:{P_DARK}; border-radius:8px;
          border:1px solid {C_GREEN}33; margin-bottom:12px; font-size:11px;'>
         <span style='color:{C_GREEN}; font-weight:700;'>✓ FILE LOADED</span>
-        <span style='color:#C8A8FF; margin-left:8px;'>{uploaded_file.name}</span>
+        <span style='color:#C8A8FF; margin-left:8px;'>{st.session_state.get("_data_key","").split("_")[0]}</span>
     </div>
     """, unsafe_allow_html=True)
 

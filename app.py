@@ -6,7 +6,6 @@ import joblib
 import logging
 import warnings
 import os
-import requests
 import io
 from datetime import datetime
 warnings.filterwarnings("ignore")
@@ -67,6 +66,13 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
     display: inline-block; padding: 4px 14px; border-radius: 20px;
     font-size: 12px; font-weight: 600; letter-spacing: 1px; margin: 2px;
 }}
+.upload-zone {{
+    border: 2px dashed {P_NEON}66 !important;
+    border-radius: 16px !important;
+    background: {P_CARD} !important;
+    padding: 40px 20px !important;
+    text-align: center !important;
+}}
 .stButton > button {{
     background: linear-gradient(135deg, {P_MID} 0%, {P_NEON} 100%) !important;
     color: white !important; border: none !important; border-radius: 8px !important;
@@ -101,46 +107,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def get_path(filename):
     return os.path.join(BASE_DIR, filename)
 
-# ── Google Drive file ID ──────────────────────────────────────────────────────
-GDRIVE_FILE_ID = "13iYJfC6kEFutN5nGGr0MlrQ_V2LQOLF2"
 
-@st.cache_data(ttl=3600, show_spinner="Loading fleet telemetry from Google Drive...")
-def load_data():
-    """Download parquet from Google Drive and load into DataFrame."""
-    # Direct download URL for Google Drive
-    url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm=t"
+# ── Load parquet from uploaded file bytes ─────────────────────────────────────
+@st.cache_data(show_spinner="Parsing telemetry data...")
+def load_data_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_parquet(io.BytesIO(file_bytes))
 
-    try:
-        session = requests.Session()
-        response = session.get(url, stream=True, timeout=120)
+    if not pd.api.types.is_datetime64_any_dtype(df['Log_Date_Time']):
+        df['Log_Date_Time'] = pd.to_datetime(df['Log_Date_Time'])
 
-        # Handle Google's virus-scan warning page for large files
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm={value}"
-                response = session.get(url, stream=True, timeout=120)
-                break
+    for col in ['FTHP','CHP','ABP','FLT','GIP','GIR','Battery_Voltage',
+                'FTHP_battery_volt','CHP_battery_volt','ABP_battery_volt']:
+        if col not in df.columns:
+            df[col] = 0.0
 
-        response.raise_for_status()
-        content = response.content
-        df = pd.read_parquet(io.BytesIO(content))
-
-        # Ensure datetime
-        if not pd.api.types.is_datetime64_any_dtype(df['Log_Date_Time']):
-            df['Log_Date_Time'] = pd.to_datetime(df['Log_Date_Time'])
-
-        # Fill missing sensor columns with 0
-        for col in ['FTHP','CHP','ABP','FLT','GIP','GIR','Battery_Voltage',
-                    'FTHP_battery_volt','CHP_battery_volt','ABP_battery_volt']:
-            if col not in df.columns:
-                df[col] = 0.0
-
-        return df
-
-    except Exception as e:
-        st.error(f"Failed to load data from Google Drive: {e}")
-        st.info("Make sure the Google Drive file is shared as 'Anyone with the link can view'.")
-        st.stop()
+    return df
 
 
 @st.cache_resource
@@ -272,10 +253,8 @@ def plotly_dark(fig, height=350, **kw):
     return fig
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
+# ── Load models ───────────────────────────────────────────────────────────────
 mdls = load_models()
-df   = load_data()
-well_list = sorted(df['well_id'].unique().tolist())
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
@@ -285,16 +264,16 @@ st.markdown(f"""
     <div style='display:inline-block; vertical-align:middle; margin-left:18px;'>
         <div style='font-size:11px; color:{P_NEON}; letter-spacing:2px; text-transform:uppercase;'>AI CAPABILITY 04</div>
         <div style='font-size:26px; font-weight:800; color:{P_WHITE}; font-family:"Space Grotesk",sans-serif;'>
-            Leak & Integrity Detection
+            Leak &amp; Integrity Detection
         </div>
     </div>
     <span style='float:right; font-size:11px; color:#C8A8FF; margin-top:8px;'>
-        {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;|&nbsp; {len(well_list)} Wells Loaded
+        {datetime.now().strftime("%Y-%m-%d %H:%M")}
     </span>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── File Upload (sidebar + main area fallback) ────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
     <div style='text-align:center; padding:20px 0 12px;'>
@@ -304,6 +283,62 @@ with st.sidebar:
             Intelligence Platform
         </div>
         <div style='height:1px; background:linear-gradient(90deg,transparent,{P_NEON},transparent); margin:12px 0;'></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"<div style='font-size:11px; color:{P_NEON}; letter-spacing:2px; text-transform:uppercase; margin-bottom:6px;'>📂 Load Fleet Data</div>", unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "Upload Parquet File",
+        type=["parquet"],
+        help="Upload your fleet telemetry .parquet file",
+        label_visibility="collapsed"
+    )
+
+# ── Show upload prompt if no file yet ────────────────────────────────────────
+if uploaded_file is None:
+    st.markdown(f"""
+    <div style='display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:60vh; gap:20px;'>
+        <div style='text-align:center; padding:60px 40px; background:{P_CARD};
+             border:2px dashed {P_NEON}55; border-radius:20px;
+             box-shadow:0 0 60px {P_GLOW}; max-width:520px;'>
+            <div style='font-size:56px; margin-bottom:16px;'>🛢</div>
+            <div style='font-size:28px; font-weight:800; color:{P_NEON};
+                        font-family:"Space Grotesk",sans-serif; letter-spacing:2px;
+                        text-shadow:0 0 20px {P_NEON}66; margin-bottom:10px;'>
+                No Data Loaded
+            </div>
+            <div style='font-size:15px; color:#C8A8FF; margin-bottom:6px; line-height:1.6;'>
+                Upload your fleet telemetry <b style="color:{P_WHITE};">.parquet</b> file
+                using the sidebar panel on the left to begin leak &amp; integrity analysis.
+            </div>
+            <div style='margin-top:20px; padding:12px 20px; background:{P_DARK}; border-radius:10px;
+                 border:1px solid {P_NEON}22; font-size:11px; color:#8877AA; text-align:left;'>
+                <div style='color:{P_NEON}; font-weight:700; margin-bottom:6px; letter-spacing:1px;'>EXPECTED COLUMNS</div>
+                well_id · well_type · Log_Date_Time · FTHP · CHP · ABP · GIP · FLT · GIR · Battery_Voltage
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+# ── Parse uploaded file ───────────────────────────────────────────────────────
+file_bytes = uploaded_file.read()
+try:
+    df = load_data_from_bytes(file_bytes)
+except Exception as e:
+    st.error(f"Failed to parse parquet file: {e}")
+    st.stop()
+
+well_list = sorted(df['well_id'].unique().tolist())
+
+# ── Sidebar controls (after data loaded) ─────────────────────────────────────
+with st.sidebar:
+    st.markdown(f"""
+    <div style='padding:8px 12px; background:{P_DARK}; border-radius:8px;
+         border:1px solid {C_GREEN}33; margin-bottom:12px; font-size:11px;'>
+        <span style='color:{C_GREEN}; font-weight:700;'>✓ FILE LOADED</span>
+        <span style='color:#C8A8FF; margin-left:8px;'>{uploaded_file.name}</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -323,7 +358,7 @@ with st.sidebar:
     min_date   = well_dates.min().date()
     max_date   = well_dates.max().date()
     date_range = st.date_input("Date Range", value=(min_date, max_date),
-                                min_value=min_date, max_value=max_date)
+                               min_value=min_date, max_value=max_date)
 
     model_status = "Ensemble (AE + IsolationForest)" if mdls and mdls.get('ae_loaded') else "IsolationForest only"
     st.markdown(f"""
@@ -335,6 +370,13 @@ with st.sidebar:
         <div style='color:{P_NEON}; font-weight:600; letter-spacing:1px;'>LEAK DETECTION ACTIVE</div>
     </div>
     """, unsafe_allow_html=True)
+
+# ── Update header well count now we have data ─────────────────────────────────
+st.markdown(f"""
+<div style='font-size:11px; color:#C8A8FF; text-align:right; margin-top:-16px; margin-bottom:8px;'>
+    {len(well_list)} Wells Loaded &nbsp;|&nbsp; {len(df):,} Rows
+</div>
+""", unsafe_allow_html=True)
 
 # ── Well data ─────────────────────────────────────────────────────────────────
 well_data = df[df['well_id'] == selected_well].copy()
@@ -619,10 +661,10 @@ with tab4:
     plotly_dark(fig_g, height=260, title="GIR Metrics Over Time")
     st.plotly_chart(fig_g, use_container_width=True)
     g1, g2, g3, g4 = st.columns(4)
-    with g1: st.metric("Avg GIR",       f"{recent['GIR'].mean():.2f}"        if 'GIR'        in recent.columns else "N/A")
-    with g2: st.metric("Avg GIR scmd",  f"{recent['gir_scmd'].mean():.2f}"   if 'gir_scmd'   in recent.columns else "N/A")
-    with g3: st.metric("Avg sm3/hr",    f"{recent['gir_sm3_hr'].mean():.2f}" if 'gir_sm3_hr' in recent.columns else "N/A")
-    with g4: st.metric("Avg mmscfd",    f"{recent['gir_mmscfd'].mean():.4f}" if 'gir_mmscfd' in recent.columns else "N/A")
+    with g1: st.metric("Avg GIR",      f"{recent['GIR'].mean():.2f}"        if 'GIR'        in recent.columns else "N/A")
+    with g2: st.metric("Avg GIR scmd", f"{recent['gir_scmd'].mean():.2f}"   if 'gir_scmd'   in recent.columns else "N/A")
+    with g3: st.metric("Avg sm3/hr",   f"{recent['gir_sm3_hr'].mean():.2f}" if 'gir_sm3_hr' in recent.columns else "N/A")
+    with g4: st.metric("Avg mmscfd",   f"{recent['gir_mmscfd'].mean():.4f}" if 'gir_mmscfd' in recent.columns else "N/A")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab5:

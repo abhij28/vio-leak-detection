@@ -4,3 +4,5 @@ numpy
 plotly
 joblib
 scikit-learn
+pyarrow
+requests
